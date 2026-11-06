@@ -37,7 +37,7 @@ class BrushWeight(_PluginBase):
     plugin_name = "刷流动态配额"
     plugin_desc = "按各站分享率动态调整站点刷流每个站点的保种配额和同时下载数，分享率越低配额越多。"
     plugin_icon = "brush-flow.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "peter5842"
     author_url = "https://github.com/peter5842"
     plugin_config_prefix = "brushweight_"
@@ -227,9 +227,9 @@ class BrushWeight(_PluginBase):
             logger.error(f"{self.plugin_name}：刷流插件未设置全局保种体积，无法分配")
             return
 
-        userdata = self.__mp_api("GET", "/site/userdata/latest", {"page": 1, "count": 200})
+        userdata = self.__unwrap(self.__mp_api("GET", "/site/userdata/latest", {"page": 1, "count": 200}))
         if not isinstance(userdata, list):
-            raise RuntimeError(f"读取站点数据失败：{userdata}")
+            raise RuntimeError("读取站点数据失败")
         latest = {row["domain"]: row for row in userdata if isinstance(row, dict) and row.get("domain")}
 
         tasks = []
@@ -289,8 +289,8 @@ class BrushWeight(_PluginBase):
 
     def __site_ratio(self, site_id: Any, latest: Dict[str, dict]) -> Tuple[Optional[float], str]:
         """返回 (用于加权的分享率 或 None, 说明)。"""
-        site = self.__mp_api("GET", f"/site/{site_id}") if site_id else None
-        domain = (site or {}).get("domain")
+        site = self.__unwrap(self.__mp_api("GET", f"/site/{site_id}")) if site_id else None
+        domain = site.get("domain") if isinstance(site, dict) else None
         if not domain:
             return None, "站点不存在"
         stat = latest.get(domain)
@@ -315,6 +315,13 @@ class BrushWeight(_PluginBase):
         if not isinstance(resp, dict) or not resp.get("success"):
             raise RuntimeError(f"刷流插件接口 {method} {path} 失败：{(resp or {}).get('message') if isinstance(resp, dict) else resp}")
         return resp.get("data")
+
+    @staticmethod
+    def __unwrap(resp: Any) -> Any:
+        """MoviePilot V3 把接口结果包在 {success, message, data} 里；失败时返回 None。"""
+        if isinstance(resp, dict) and "success" in resp:
+            return resp.get("data") if resp.get("success") else None
+        return resp
 
     @staticmethod
     def __mp_api(method: str, path: str, query: Optional[dict] = None, body: Any = None) -> Any:

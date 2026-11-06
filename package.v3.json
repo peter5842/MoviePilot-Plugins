@@ -16,12 +16,13 @@
     "name": "刷流动态配额",
     "description": "按各站分享率动态调整站点刷流每个站点的保种配额和同时下载数，分享率越低配额越多。",
     "labels": "刷流",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "icon": "brush-flow.png",
     "author": "peter5842",
     "level": 1,
     "system_version": ">=3.2.4",
     "history": {
+      "v1.0.2": "适配 MoviePilot V3 统一响应封装读取站点数据，出错时不再把站点数据写进日志。",
       "v1.0.1": "修复读取站点数据时分页参数超出上限（最大 200）导致无法运行的问题。",
       "v1.0.0": "首个版本：由 Unraid 定时脚本 brush_weight.py 改写为插件，规则不变。"
     }
