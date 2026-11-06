@@ -1,0 +1,28 @@
+{
+  "UnwatchedCleanup": {
+    "name": "媒体库无人观看清理",
+    "description": "删除 Plex 中长期无人观看的电影和剧集：先发通知预告，宽限期内仍无人观看才删除。",
+    "labels": "媒体库,清理",
+    "version": "1.0.0",
+    "icon": "clean.png",
+    "author": "peter5842",
+    "level": 1,
+    "system_version": ">=3.2.4",
+    "history": {
+      "v1.0.0": "首个版本：由 Unraid 定时脚本 unwatched_cleanup.py 改写为插件，规则不变，并修复删除后刷新 Plex 时报错导致删除通知发不出去的问题。"
+    }
+  },
+  "BrushWeight": {
+    "name": "刷流动态配额",
+    "description": "按各站分享率动态调整站点刷流每个站点的保种配额和同时下载数，分享率越低配额越多。",
+    "labels": "刷流",
+    "version": "1.0.0",
+    "icon": "brush-flow.png",
+    "author": "peter5842",
+    "level": 1,
+    "system_version": ">=3.2.4",
+    "history": {
+      "v1.0.0": "首个版本：由 Unraid 定时脚本 brush_weight.py 改写为插件，规则不变。"
+    }
+  }
+}
