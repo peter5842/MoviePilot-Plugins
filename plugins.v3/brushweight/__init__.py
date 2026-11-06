@@ -37,7 +37,7 @@ class BrushWeight(_PluginBase):
     plugin_name = "刷流动态配额"
     plugin_desc = "按各站分享率动态调整站点刷流每个站点的保种配额和同时下载数，分享率越低配额越多。"
     plugin_icon = "brush-flow.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "peter5842"
     author_url = "https://github.com/peter5842"
     plugin_config_prefix = "brushweight_"
@@ -227,7 +227,7 @@ class BrushWeight(_PluginBase):
             logger.error(f"{self.plugin_name}：刷流插件未设置全局保种体积，无法分配")
             return
 
-        userdata = self.__mp_api("GET", "/site/userdata/latest", {"page": 1, "count": 500})
+        userdata = self.__mp_api("GET", "/site/userdata/latest", {"page": 1, "count": 200})
         if not isinstance(userdata, list):
             raise RuntimeError(f"读取站点数据失败：{userdata}")
         latest = {row["domain"]: row for row in userdata if isinstance(row, dict) and row.get("domain")}
