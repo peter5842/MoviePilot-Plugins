@@ -27,7 +27,15 @@ class IyuuHelper:
         self._stop = stop_event if stop_event is not None else Event()
         self._sites = {}
         self._sid_sha1 = None
+        self._defer_until = 0.0
+        self._defer_error = ""
         self.last_error = ""
+
+    def _defer(self, error: str, seconds: int = 60) -> Tuple[None, str]:
+        """暂缓共享握手或限流后的请求，避免后续批次连续请求同一故障接口。"""
+        self._defer_until = max(self._defer_until, time.monotonic() + seconds)
+        self._defer_error = error
+        return None, error
 
     def _safe_message(self, message) -> str:
         text = str(message or "")
@@ -40,14 +48,18 @@ class IyuuHelper:
         """Retry query/handshake requests only; never retry an authentication rejection."""
         if not self._token:
             return None, "请求IYUU失败，未配置Token"
+        if time.monotonic() < self._defer_until:
+            return None, f"IYUU请求冷却中，稍后重试：{self._defer_error}"
         error = "请求IYUU失败"
         for attempt in range(1, self._attempts + 1):
             if self._stop.is_set():
                 return None, "IYUU查询已停止"
             delay = 2 ** attempt
             retryable = True
+            response = None
             try:
-                client = RequestUtils(accept_type="application/json", headers={"token": self._token},
+                client = RequestUtils(headers={"token": self._token, "Accept": "application/json",
+                                               "Content-Type": "application/json"},
                                       timeout=self._timeout)
                 if method == "post":
                     response = client.post_res(self._api_base + url, json=params, raise_exception=True)
@@ -59,9 +71,12 @@ class IyuuHelper:
                     error = f"HTTP {response.status_code}"
                     retryable = response.status_code in self._retry_statuses
                     retry_after = response.headers.get("Retry-After", "")
+                    if response.status_code == 429 and not str(retry_after).isdigit():
+                        return self._defer(f"请求IYUU {url} 失败，HTTP 429，暂停请求至少60秒")
                     if str(retry_after).isdigit():
                         if int(retry_after) > 30:
-                            return None, f"请求IYUU失败，{error}，服务端要求等待{retry_after}秒，本轮停止重试"
+                            return self._defer(f"请求IYUU {url} 失败，{error}，服务端要求等待{retry_after}秒，本轮停止重试",
+                                               int(retry_after))
                         delay = max(delay, int(retry_after))
                 else:
                     try:
@@ -71,8 +86,11 @@ class IyuuHelper:
                     if not isinstance(result, dict) or "code" not in result:
                         error = "响应不是有效的IYUU JSON对象"
                     elif str(result["code"]) != "0":
-                        return None, (f"请求IYUU失败，业务码 {self._safe_message(result['code'])}："
-                                      f"{self._safe_message(result.get('msg'))}")
+                        message = self._safe_message(result.get("msg"))
+                        error = f"请求IYUU {url} 失败，业务码 {self._safe_message(result['code'])}：{message}"
+                        if re.search(r"频率|频繁|rate.?limit|too many", message, re.IGNORECASE):
+                            return self._defer(error + "，暂停请求至少60秒")
+                        return None, error
                     elif not isinstance(result.get("data"), dict):
                         error = "成功响应缺少有效data对象"
                     else:
@@ -81,7 +99,8 @@ class IyuuHelper:
                 # Exception text and response bodies can contain credentials; retain only the type.
                 error = f"网络异常 {type(exc).__name__}"
             if not retryable or attempt == self._attempts:
-                return None, f"请求IYUU失败，{error}（已尝试{attempt}次）"
+                failure = f"请求IYUU {url} 失败，{error}（已尝试{attempt}次）"
+                return self._defer(failure) if response is not None and response.status_code == 429 else (None, failure)
             logger.warning(f"IYUU {url}：{error}，{delay}秒后重试（{attempt}/{self._attempts}）")
             if self._stop.wait(delay):
                 return None, "IYUU查询已停止"
@@ -129,17 +148,22 @@ class IyuuHelper:
     def get_seed_info(self, info_hashs: list) -> Tuple[Optional[dict], str]:
         if not info_hashs:
             return {}, ""
+        if time.monotonic() < self._defer_until:
+            self.last_error = f"IYUU请求冷却中，稍后重试：{self._defer_error}"
+            return None, self.last_error
         if not self._sid_sha1:
             self._sid_sha1, error = self.__report_existing()
             if error:
                 self.last_error = error
-                return None, error
+                return self._defer(error)
         payload = json.dumps(sorted(info_hashs), separators=(",", ":"), ensure_ascii=False)
         data, error = self.__reseed_index(payload)
         if "站点哈希值 require" in error:
             self._sid_sha1, error = self.__report_existing()
             if not error:
                 data, error = self.__reseed_index(payload)
+            else:
+                self._defer(error)
         self.last_error = error
         return data, error
 
