@@ -3,6 +3,7 @@ import ast
 from datetime import datetime, timedelta
 import hashlib
 import json
+import importlib.util
 import logging
 import os
 from pathlib import Path
@@ -18,6 +19,10 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1] / "plugins.v3/iyuuautoseed"
 logger = logging.getLogger("iyuu-test")
+spec = importlib.util.spec_from_file_location("iyuu_source_guard", ROOT / "source_guard.py")
+guard = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(guard)
+check_source = guard.check_source
 
 
 class RequestException(Exception):
@@ -302,3 +307,129 @@ def test_matched_seed_result_is_reflected_in_task_outcome(run, download_ok):
             plugin.auto_seed()
         assert saved["last_run"]["status"] == "partial" and saved["last_run"]["seed_failed"] == 1
     plugin._IYUUAutoSeed__download_torrent.assert_called_once()
+
+
+def test_query_only_probe_never_adds_starts_or_notifies(run):
+    plugin, saved, downloader = run
+    plugin._notify = True
+    plugin.iyuu_helper.get_seed_info.return_value = ({"source-0": {"torrent": [{"sid": 1, "info_hash": "new"}]}}, "")
+    plugin._IYUUAutoSeed__download_torrent = Mock()
+    result = plugin.probe_queries()
+    assert result["query_only"] and result["query_ok"] == 3
+    assert saved["last_probe"]["status"] == "completed" and "last_run" not in saved
+    plugin._IYUUAutoSeed__download_torrent.assert_not_called()
+    plugin.check_recheck.assert_not_called()
+    plugin.update_config.assert_not_called()
+    plugin.post_message.assert_not_called()
+
+
+@pytest.mark.parametrize("case", ["valid", "missing_root", "missing_file", "wrong_size", "unmapped", "escape", "symlink", "empty_list"])
+def test_source_guard_checks_real_files(tmp_path, case):
+    root = tmp_path / "source"
+    folder = root / "film"
+    folder.mkdir(parents=True)
+    file = folder / "video.mkv"
+    file.write_bytes(b"source")
+    torrent = {"hash": "source", "save_path": "/downloads", "content_path": "/downloads/film"}
+    files = [{"name": "film/video.mkv", "size": 6}]
+    mappings = f"{root}:/downloads"
+    if case == "missing_root":
+        file.unlink(); folder.rmdir()
+    elif case == "missing_file":
+        file.unlink()
+    elif case == "wrong_size":
+        file.write_bytes(b"partial")
+    elif case == "unmapped":
+        torrent["save_path"] = "/elsewhere"
+    elif case == "escape":
+        files[0]["name"] = "../outside"
+    elif case == "symlink":
+        outside = tmp_path / "outside"
+        outside.write_bytes(b"source")
+        file.unlink(); file.symlink_to(outside)
+    elif case == "empty_list":
+        files = []
+    get_files = Mock(return_value=files)
+    ready, reason = check_source(torrent, get_files, mappings)
+    assert ready == (case == "valid")
+    if case != "valid":assert reason
+    if case == "missing_root":get_files.assert_not_called()
+
+
+def test_missing_source_is_excluded_before_iyuu_query(run, tmp_path):
+    plugin, saved, downloader = run
+    plugin._source_path_mappings = f"{tmp_path}:/source"
+    plugin.auto_seed()
+    assert saved["last_run"]["source_skipped"] == 401
+    plugin.iyuu_helper.get_seed_info.assert_not_called()
+
+
+@pytest.mark.parametrize("reason,permanent", [("种子数据有误，请确认链接是否正确", False), ("无法打开链接", False), ("触发站点流控", False), ("下载种子出错，状态码：403", False), ("下载种子出错，状态码：404", True), ("下载种子出错，状态码：410", True)])
+def test_download_errors_only_cache_explicit_removal(run, monkeypatch, reason, permanent):
+    plugin, saved, downloader = run
+    plugin.total = plugin.realtotal = plugin.fail = plugin.cached = 0
+    plugin._run_summary = {"errors": []}
+    plugin._deferred_hashes = set()
+    plugin.iyuu_helper.get_torrent_url.return_value = ("https://site.invalid", "download")
+    site = {"id": 1, "name": "site", "url": "https://site.invalid"}
+    sites = Mock()
+    sites.get_indexer.return_value = site
+    sites.check.return_value = (False, "")
+    monkeypatch.setitem(plugin_ns, "SitesHelper", lambda: sites)
+    monkeypatch.setitem(plugin_ns, "StringUtils", SimpleNamespace(get_url_domain=lambda _: "site.invalid"))
+    monkeypatch.setitem(plugin_ns, "settings", SimpleNamespace(USER_AGENT="test"))
+    helper = Mock()
+    helper.download_torrent.return_value = (None, None, "", [], reason)
+    monkeypatch.setitem(plugin_ns, "TorrentHelper", lambda: helper)
+    downloader.get_torrents.return_value = ([], None)
+    plugin._IYUUAutoSeed__get_download_url = Mock(return_value="https://site.invalid/download?token=private")
+    service = SimpleNamespace(name="qB", type="qbittorrent", instance=downloader)
+    assert not plugin._IYUUAutoSeed__download_torrent({"sid": 1, "info_hash": "candidate"}, service, "/source", None)
+    assert ("candidate" in plugin._permanent_error_caches) == permanent
+    assert ("candidate" in plugin._deferred_hashes) == (not permanent)
+    assert not plugin._error_caches
+    assert helper.download_torrent.call_args.kwargs["cache_invalid"] is False
+    assert helper.download_torrent.call_args.kwargs["site_id"] == 1
+
+
+def test_recheck_queue_persists_and_releases_busy_flag_on_failure(run):
+    plugin, saved, _ = run
+    plugin._recheck_torrents = {"qB": ["new-seed"]}
+    plugin._auto_rechecked = {"new-seed", "finished-seed"}
+    plugin._is_recheck_running = False
+    plugin.check_recheck_service = Mock(side_effect=RuntimeError("offline"))
+    with pytest.raises(RuntimeError):
+        Plugin.check_recheck(plugin)
+    assert not plugin._is_recheck_running
+    assert saved["pending_rechecks"] == {"qB": ["new-seed"]}
+    assert saved["rechecked_once"] == ["new-seed"]
+
+
+def test_explicit_queue_migration_only_tracks_requested_pending_tasks(run):
+    plugin, saved, downloader = run
+    plugin._recheck_torrents, plugin._auto_rechecked = {}, set()
+    pending, active, unrelated = "a" * 40, "b" * 40, "c" * 40
+    downloader.get_torrents.return_value = ([{"hash": pending, "state": "checkingDL"}, {"hash": active, "state": "uploading"}, {"hash": unrelated, "state": "stoppedUP"}], None)
+    assert plugin.restore_checks({"downloaders": {"qB": [pending, active]}}) == {"restored": 1}
+    assert saved["pending_rechecks"] == {"qB": [pending]}
+    downloader.start_torrents.assert_not_called()
+    downloader.recheck_torrents.assert_not_called()
+
+
+@pytest.mark.parametrize("payload", [{}, {"downloaders": {"other": ["a" * 40]}}, {"downloaders": {"qB": ["not-a-hash"]}}])
+def test_queue_migration_rejects_ambiguous_requests(run, payload):
+    plugin, saved, downloader = run
+    with pytest.raises(ValueError):plugin.restore_checks(payload)
+    assert "pending_rechecks" not in saved
+    downloader.get_torrents.assert_not_called()
+
+
+def test_failed_start_keeps_pending_check_but_removed_task_is_pruned(run):
+    plugin, saved, downloader = run
+    plugin._recheck_torrents = {"qB": ["pending", "removed"]}
+    plugin._auto_rechecked = set()
+    plugin._is_recheck_running = False
+    downloader.get_torrents.return_value = ([{"hash": "pending", "state": "stoppedUP", "progress": 1}], None)
+    downloader.start_torrents.return_value = False
+    Plugin.check_recheck(plugin)
+    assert saved["pending_rechecks"] == {"qB": ["pending"]}

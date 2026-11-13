@@ -20,6 +20,7 @@ from app.helper.torrent import TorrentHelper
 from app.log import logger
 from app.plugins import _PluginBase
 from .iyuu_helper import IyuuHelper
+from .source_guard import check_source
 from app.schemas import NotificationType, ServiceInfo
 from app.schemas.types import EventType
 from app.utils.http import RequestUtils
@@ -34,7 +35,7 @@ class IYUUAutoSeed(_PluginBase):
     # 插件图标
     plugin_icon = "IYUU.png"
     # 插件版本
-    plugin_version = "2.22.1"
+    plugin_version = "2.22.2"
     # 插件作者
     plugin_author = "jxxghp,CKun,peter5842"
     # 作者主页
@@ -68,6 +69,7 @@ class IYUUAutoSeed(_PluginBase):
     _categoryafterseed = None
     _addhosttotag = False
     _size = None
+    _source_path_mappings = ""
     _clearcache = False
     _auto_start = False
     # 退出事件
@@ -126,6 +128,7 @@ class IYUUAutoSeed(_PluginBase):
             self._reuse_save_path = config.get("reuse_save_path", True)
             self._addhosttotag = config.get("addhosttotag")
             self._size = float(config.get("size")) if config.get("size") else 0
+            self._source_path_mappings = config.get("source_path_mappings") or ""
             self._clearcache = config.get("clearcache")
             self._permanent_error_caches = (
                 [] if self._clearcache else list(config.get("permanent_error_caches") or [])
@@ -144,9 +147,10 @@ class IYUUAutoSeed(_PluginBase):
 
         # 停止现有任务
         self.stop_service()
-        # 重新初始化运行期校验队列，避免类级字典跨插件重载残留。
-        self._recheck_torrents = {}
-        self._auto_rechecked = set()
+        # Only restore explicitly tracked checks; never restart arbitrary user-paused torrents.
+        self._recheck_torrents = self.get_data("pending_rechecks") or {}
+        self._auto_rechecked = set(self.get_data("rechecked_once") or [])
+        self._is_recheck_running = False
 
         # 启动定时任务 & 立即运行一次
         if self.get_state() or self._onlyonce:
@@ -229,7 +233,45 @@ class IYUUAutoSeed(_PluginBase):
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [{"path": "/status", "endpoint": self.query_status, "methods": ["GET"],
-                 "auth": "apikey", "summary": "IYUU最近辅种任务的真实结果"}]
+                 "auth": "apikey", "summary": "IYUU最近辅种任务的真实结果"},
+                {"path": "/check", "endpoint": self.probe_queries, "methods": ["POST"],
+                 "auth": "apikey", "summary": "仅检查源文件与IYUU查询，不添加或启动种子"},
+                {"path": "/checks/restore", "endpoint": self.restore_checks, "methods": ["POST"],
+                 "auth": "apikey", "summary": "迁移明确指定的旧版本待校验任务"}]
+
+    def probe_queries(self) -> dict:
+        return self.auto_seed(query_only=True)
+
+    def restore_checks(self, payload: dict) -> dict:
+        """Explicit administrator-selected migration; never discover arbitrary paused tasks."""
+        if self._seed_lock.locked():
+            raise ValueError("辅种任务仍在运行，不能恢复校验队列")
+        requested = payload.get("downloaders")
+        if not isinstance(requested, dict) or not requested:
+            raise ValueError("必须明确指定下载器和待恢复任务")
+        allowed = set(self._downloaders or []) | ({self._auto_downloader} if self._auto_downloader else set())
+        services = DownloaderHelper().get_services(name_filters=list(allowed))
+        restored = {}
+        for name, hashes in requested.items():
+            if (name not in allowed or name not in services or not isinstance(hashes, list)
+                    or len(hashes) > 2000 or any(not isinstance(h, str) or not re.fullmatch(r"[a-fA-F0-9]{40}|[a-fA-F0-9]{64}", h) for h in hashes)):
+                raise ValueError("下载器或任务列表无效")
+            service = services[name]
+            if service.type != "qbittorrent":
+                raise ValueError("旧版本队列迁移仅支持qBittorrent")
+            if not hashes:
+                restored[name] = []
+                continue
+            torrents, error = service.instance.get_torrents(ids=hashes)
+            if torrents is None or error:
+                raise ValueError("无法核实待恢复的下载器任务")
+            requested_hashes = {h.lower() for h in hashes}
+            restored[name] = [t.get("hash") for t in torrents if t.get("hash") in requested_hashes
+                              and t.get("state") in {"checkingDL", "checkingUP", "checkingResumeData", "stoppedDL", "pausedDL", "stoppedUP", "pausedUP"}]
+        for name, hashes in restored.items():
+            self._recheck_torrents[name] = sorted(set(self._recheck_torrents.get(name, [])) | set(hashes))
+        self._save_rechecks()
+        return {"restored": sum(len(hashes) for hashes in restored.values())}
 
     def query_status(self) -> dict:
         return self.get_data("last_run") or {}
@@ -271,6 +313,11 @@ class IYUUAutoSeed(_PluginBase):
             {
                 'component': 'VForm',
                 'content': [
+                    {"component": "VTextarea", "props": {
+                        "model": "source_path_mappings", "label": "qB源文件检查路径映射（可选）",
+                        "placeholder": "/download/qBittorrent/shualiu:/downloads/shualiu",
+                        "hint": "每行 MoviePilot路径:下载器路径；填写后仅为路径和文件大小核验通过的源任务辅种。留空不检查本地文件。",
+                        "persistent-hint": True, "rows": 2}},
                     {
                         'component': 'VRow',
                         'content': [
@@ -678,6 +725,7 @@ class IYUUAutoSeed(_PluginBase):
             "auto_category": False,
             "auto_start": False,
             "reuse_save_path": True,
+            "source_path_mappings": "",
             "cron": "",
             "token": "",
             "downloaders": [],
@@ -698,6 +746,7 @@ class IYUUAutoSeed(_PluginBase):
                   "failed": "失败", "stopped": "已停止"}
         text = (f"最近任务：{labels.get(run.get('status'), '未知')}；"
                 f"查询成功 {run.get('query_ok', 0)} 批，失败 {run.get('query_failed', 0)} 批；"
+                f"源文件检查未通过 {run.get('source_skipped', 0)} 个；"
                 f"辅种成功 {run.get('seed_success', 0)} 个，失败 {run.get('seed_failed', 0)} 个。"
                 f"开始：{run.get('started_at', '')}；结束：{run.get('finished_at', '')}")
         return [{"component": "VAlert", "text": text,
@@ -725,6 +774,7 @@ class IYUUAutoSeed(_PluginBase):
             "auto_start": self._auto_start,
             "reuse_save_path": self._reuse_save_path,
             "size": self._size,
+            "source_path_mappings": self._source_path_mappings,
             "success_caches": self._success_caches,
             "error_caches": self._error_caches,
             "permanent_error_caches": self._permanent_error_caches
@@ -756,16 +806,20 @@ class IYUUAutoSeed(_PluginBase):
             cache.append(value)
         self.__trim_seed_cache(cache)
 
-    def auto_seed(self):
+    def auto_seed(self, query_only: bool = False):
         """Persist the actual outcome and propagate failures to the host scheduler."""
         if not self._seed_lock.acquire(blocking=False):
             raise RuntimeError("IYUU辅种任务已在运行，跳过重复执行")
+        self._probe_mode = query_only
+        self._summary_key = "last_probe" if query_only else "last_run"
+        self._deferred_hashes = set()
         self._run_summary = {"status": "running", "started_at": datetime.now().isoformat(timespec="seconds"),
                              "query_ok": 0, "query_failed": 0, "failed_sources": 0,
-                             "seed_success": 0, "seed_failed": 0, "errors": []}
+                             "seed_success": 0, "seed_failed": 0, "source_skipped": 0,
+                             "query_only": query_only, "errors": []}
         self.success = self.fail = 0
         try:
-            self.save_data("last_run", self._run_summary)
+            self.save_data(self._summary_key, self._run_summary)
             self._run_auto_seed()
             if self._event.is_set():
                 self._run_summary["status"] = "stopped"
@@ -786,9 +840,10 @@ class IYUUAutoSeed(_PluginBase):
             try:
                 self._run_summary.update(finished_at=datetime.now().isoformat(timespec="seconds"),
                                          seed_success=self.success, seed_failed=self.fail)
-                self.save_data("last_run", self._run_summary)
+                self.save_data(self._summary_key, self._run_summary)
             finally:
                 self._seed_lock.release()
+        return self._run_summary
 
     def _run_auto_seed(self):
         """
@@ -870,6 +925,13 @@ class IYUUAutoSeed(_PluginBase):
                     if torrent.total_size != torrent.completed:
                         logger.info(f"种子 {hash_str} 完成字节数与总体积不一致，跳过 ...")
                         continue
+                    ready, reason = check_source(torrent, downloader_obj.get_files, self._source_path_mappings)
+                    if not ready:
+                        self._run_summary["source_skipped"] += 1
+                        message = f"下载器 {downloader} 源任务 {hash_str[:8]}：{reason}，本轮跳过"
+                        self._run_summary["errors"] = (self._run_summary["errors"] + [message])[-20:]
+                        logger.warning(message)
+                        continue
                 category = self.__get_category(torrent=torrent, dl_type=service.type) if self._auto_category else None
                 hash_strs.append({
                     "hash": hash_str,
@@ -895,14 +957,16 @@ class IYUUAutoSeed(_PluginBase):
                     logger.warning(f"下载器 {downloader} 存在查询失败批次，保留源种子，下轮重试")
                 else:
                     logger.info(f"下载器 {downloader} 所有批次查询完成。")
-                self.check_recheck()
+                if not self._probe_mode:
+                    self.check_recheck()
             else:
                 logger.info(f"没有需要辅种的种子")
 
         # 保存缓存
-        self.__update_config()
+        if not self._probe_mode:
+            self.__update_config()
         # 发送消息
-        if self._notify:
+        if self._notify and not self._probe_mode:
             if self.success or self.fail or self._run_summary["query_failed"]:
                 self.post_message(
                     mtype=NotificationType.SiteMessage,
@@ -925,17 +989,21 @@ class IYUUAutoSeed(_PluginBase):
         if self._is_recheck_running:
             return
         self._is_recheck_running = True
-        if self.auto_service_info:
-            # 检查指定下载器
-            self.check_recheck_service(self.auto_service_info)
+        try:
+            if self.auto_service_info:
+                self.check_recheck_service(self.auto_service_info)
+            else:
+                for service in (self.service_infos or {}).values():
+                    self.check_recheck_service(service)
+        finally:
             self._is_recheck_running = False
-            return
-        if not self.service_infos:
-            return
-        for service in self.service_infos.values():
-            # 需要检查的种子
-            self.check_recheck_service(service)
-        self._is_recheck_running = False
+            self._save_rechecks()
+
+    def _save_rechecks(self):
+        self.save_data("pending_rechecks", self._recheck_torrents)
+        pending = {value for values in self._recheck_torrents.values() for value in values}
+        self._auto_rechecked.intersection_update(pending)
+        self.save_data("rechecked_once", sorted(self._auto_rechecked))
 
     def check_recheck_service(self, service: ServiceInfo):
         """
@@ -951,6 +1019,9 @@ class IYUUAutoSeed(_PluginBase):
         # 获取下载器中的种子状态
         torrents, _ = downloader_obj.get_torrents(ids=recheck_torrents)
         if torrents:
+            live_hashes = {self.__get_hash(torrent=t, dl_type=service.type) for t in torrents}
+            recheck_torrents = [h for h in recheck_torrents if h in live_hashes]
+            self._recheck_torrents[downloader] = recheck_torrents
             can_seeding_torrents = []
             need_recheck_torrents = []
             for torrent in torrents:
@@ -969,10 +1040,12 @@ class IYUUAutoSeed(_PluginBase):
             if can_seeding_torrents:
                 logger.info(f"共 {len(can_seeding_torrents)} 个任务校验完成，开始辅种 ...")
                 # 开始任务
-                downloader_obj.start_torrents(ids=can_seeding_torrents)
-                # 去除已经处理过的种子
-                self._recheck_torrents[downloader] = list(
-                    set(recheck_torrents).difference(set(can_seeding_torrents)))
+                started = downloader_obj.start_torrents(ids=can_seeding_torrents)
+                if started is False:
+                    logger.warning(f"下载器 {downloader} 未确认启动，保留校验队列稍后重试")
+                else:
+                    self._recheck_torrents[downloader] = list(
+                        set(recheck_torrents).difference(set(can_seeding_torrents)))
             if need_recheck_torrents:
                 logger.info(f"共 {len(need_recheck_torrents)} 个任务未校验，自动补发校验 ...")
                 self._auto_rechecked.update(need_recheck_torrents)
@@ -1010,15 +1083,19 @@ class IYUUAutoSeed(_PluginBase):
             self._run_summary["failed_sources"] += len(hashs)
             error = f"下载器 {service.name}，{len(hashs)} 个源种子查询失败：{msg}"
             self._run_summary["errors"] = (self._run_summary["errors"] + [error])[-20:]
-            self.save_data("last_run", self._run_summary)
+            self.save_data(self._summary_key, self._run_summary)
             logger.warning(error)
             return
         else:
             self._run_summary["query_ok"] += 1
-            self.save_data("last_run", self._run_summary)
+            self.save_data(self._summary_key, self._run_summary)
             logger.info(f"IYUU返回可辅种数：{len(seed_list)}")
+        if self._probe_mode:
+            return
         # 遍历
         for current_hash, seed_info in seed_list.items():
+            if self._event.is_set():
+                return
             if not seed_info:
                 continue
             seed_torrents = seed_info.get("torrent")
@@ -1029,11 +1106,15 @@ class IYUUAutoSeed(_PluginBase):
             success_torrents = []
 
             for seed in seed_torrents:
+                if self._event.is_set():
+                    return
                 if not seed:
                     continue
                 if not isinstance(seed, dict):
                     continue
                 if not seed.get("sid") or not seed.get("info_hash"):
+                    continue
+                if seed.get("info_hash") in self._deferred_hashes:
                     continue
                 if seed.get("info_hash") in completed_hashes_downloader:
                     logger.info(f"{seed.get('info_hash')} 已在下载器中，跳过 ...")
@@ -1197,10 +1278,8 @@ class IYUUAutoSeed(_PluginBase):
         # 获取种子站点及下载地址模板
         site_url, download_page = self.iyuu_helper.get_torrent_url(seed.get("sid"))
         if not site_url or not download_page:
-            # 加入缓存
-            self.__append_seed_cache(self._error_caches, seed.get("info_hash"))
+            self._defer_seed(seed, {"name": "IYUU站点信息"}, "未取得站点或下载地址")
             self.fail += 1
-            self.cached += 1
             return False
         # 查询站点
         site_domain = StringUtils.get_url_domain(site_url)
@@ -1232,10 +1311,8 @@ class IYUUAutoSeed(_PluginBase):
                                               site=site_info,
                                               base_url=download_page)
         if not torrent_url:
-            # 加入失败缓存
-            self.__append_seed_cache(self._error_caches, seed.get("info_hash"))
+            self._defer_seed(seed, site_info, "未能取得种子下载链接")
             self.fail += 1
-            self.cached += 1
             return False
         # 强制使用Https
         if __is_special_site(torrent_url):
@@ -1248,17 +1325,19 @@ class IYUUAutoSeed(_PluginBase):
             url=torrent_url,
             cookie=site_info.get("cookie"),
             ua=site_info.get("ua") or settings.USER_AGENT,
-            proxy=site_info.get("proxy"))
+            proxy=site_info.get("proxy"),
+            cache_invalid=False,
+            site_id=site_info.get("id"))
         if not content:
             # 下载失败
             self.fail += 1
-            # 加入失败缓存
-            if error_msg and ('无法打开链接' in error_msg or '触发站点流控' in error_msg):
-                self.__append_seed_cache(self._error_caches, seed.get("info_hash"))
-            else:
-                # 种子不存在的情况
+            # JSON/HTML, credentials and network errors do not establish that a torrent was deleted.
+            if re.search(r"(?:HTTP|状态码)[\s：:]*(?:404|410)\b", error_msg or "", re.I):
                 self.__append_seed_cache(self._permanent_error_caches, seed.get("info_hash"))
-            logger.error(f"下载种子文件失败：{torrent_url}")
+                self.cached += 1
+            else:
+                self._defer_seed(seed, site_info, error_msg or "未取得有效种子内容")
+            logger.error(f"站点 {site_info.get('name')} 下载种子失败：{error_msg or '未取得有效内容'}")
             return False
         # 添加下载，辅种任务默认暂停
         logger.info(f"添加下载任务：{torrent_url} ...")
@@ -1270,8 +1349,7 @@ class IYUUAutoSeed(_PluginBase):
         if not download_id:
             # 下载失败
             self.fail += 1
-            # 加入失败缓存
-            self.__append_seed_cache(self._error_caches, seed.get("info_hash"))
+            self._defer_seed(seed, site_info, "下载器未确认添加成功")
             return False
         else:
             self.success += 1
@@ -1295,12 +1373,20 @@ class IYUUAutoSeed(_PluginBase):
             self.__append_seed_cache(self._success_caches, seed.get("info_hash"))
             return True
 
+    def _defer_seed(self, seed, site, reason):
+        self._deferred_hashes.add(seed.get("info_hash"))
+        reason = re.sub(r"https?://\S+", "[URL]", str(reason))[:160]
+        message = f"站点 {site.get('name')}：{reason}，保留后续重试"
+        self._run_summary["errors"] = (self._run_summary["errors"] + [message])[-20:]
+
     def __add_recheck_torrents(self, service: ServiceInfo, download_id: str):
         # 追加校验任务
         logger.info(f"添加校验检查任务：{download_id} ...")
         if not self._recheck_torrents.get(service.name):
             self._recheck_torrents[service.name] = []
-        self._recheck_torrents[service.name].append(download_id)
+        if download_id not in self._recheck_torrents[service.name]:
+            self._recheck_torrents[service.name].append(download_id)
+        self._save_rechecks()
 
     @staticmethod
     def __get_hash(torrent: Any, dl_type: str):
