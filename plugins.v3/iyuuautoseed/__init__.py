@@ -244,8 +244,14 @@ class IYUUAutoSeed(_PluginBase):
 
     def restore_checks(self, payload: dict) -> dict:
         """Explicit administrator-selected migration; never discover arbitrary paused tasks."""
-        if self._seed_lock.locked():
+        if not self._seed_lock.acquire(blocking=False):
             raise ValueError("辅种任务仍在运行，不能恢复校验队列")
+        try:
+            return self._restore_checks(payload)
+        finally:
+            self._seed_lock.release()
+
+    def _restore_checks(self, payload: dict) -> dict:
         requested = payload.get("downloaders")
         if not isinstance(requested, dict) or not requested:
             raise ValueError("必须明确指定下载器和待恢复任务")
