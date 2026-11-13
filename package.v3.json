@@ -27,5 +27,18 @@
       "v1.0.1": "修复读取站点数据时分页参数超出上限（最大 200）导致无法运行的问题。",
       "v1.0.0": "首个版本：由 Unraid 定时脚本 brush_weight.py 改写为插件，规则不变。"
     }
+  },
+  "IYUUAutoSeed": {
+    "name": "IYUU自动辅种",
+    "description": "IYUU自动辅种自用修复版：查询超时重试、握手校验及真实任务结果。",
+    "labels": "做种,IYUU",
+    "version": "2.22.1",
+    "icon": "IYUU.png",
+    "author": "jxxghp,CKun,peter5842",
+    "level": 2,
+    "system_version": ">=3.2.4",
+    "history": {
+      "v2.22.1": "自用维护版本：IYUU请求45秒超时、最多3次退避重试；保留握手失败原因；失败批次不再误报完成，记录最近任务结果。"
+    }
   }
 }
