@@ -100,6 +100,36 @@ def test_long_server_backoff_defers_to_next_run(transport):
     assert "本轮停止重试" in helper.get_seed_info(["source"])[1]
     assert client.post_res.call_count == 1
     stop.wait.assert_not_called()
+    assert "冷却中" in helper.get_seed_info(["next-source"])[1]
+    assert client.post_res.call_count == 1
+
+
+@pytest.mark.parametrize("limited", [response(status=429), response(code=400, msg="访问频率过快")])
+def test_rate_limit_stops_following_batches_until_cooldown_expires(transport, monkeypatch, limited):
+    helper, client, _, stop = transport
+    clock = Mock(return_value=1000)
+    monkeypatch.setitem(helper_ns, "time", SimpleNamespace(monotonic=clock, time=lambda: 1000))
+    client.post_res.side_effect = [limited, response()]
+    assert "60秒" in helper.get_seed_info(["source"])[1]
+    clock.return_value = 1059
+    assert "冷却中" in helper.get_seed_info(["next-source"])[1]
+    assert client.post_res.call_count == 1
+    stop.wait.assert_not_called()
+    clock.return_value = 1061
+    assert helper.get_seed_info(["next-source"]) == ({}, "")
+    assert client.post_res.call_count == 2
+
+
+def test_handshake_rejection_is_not_repeated_for_each_batch(transport):
+    helper, client, factory, _ = transport
+    helper._sid_sha1 = None
+    client.get_res.return_value = response({"sites": [{"id": 1}]})
+    client.post_res.return_value = response(code=400, msg="缺少sid_list")
+    assert "/reseed/sites/reportExisting" in helper.get_seed_info(["source"])[1]
+    assert "冷却中" in helper.get_seed_info(["next-source"])[1]
+    assert client.get_res.call_count == client.post_res.call_count == 1
+    assert client.post_res.call_args.kwargs["json"] == {"sid_list": [1]}
+    assert factory.call_args.kwargs["headers"]["Content-Type"] == "application/json"
 
 
 def test_query_retry_exhaustion_is_bounded_and_does_not_leak_response(transport):
