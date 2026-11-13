@@ -6,6 +6,8 @@
 其余文件直接删除，并一并删除硬链接到这些文件的 qBittorrent 任务。
 """
 import datetime
+import fcntl
+import uuid
 import json
 import os
 import threading
@@ -25,6 +27,8 @@ from app.sdk.config import settings
 from app.sdk.logging import logger
 from app.sdk.queries import list_subscriptions, list_transfer_history
 from app.sdk.services import DownloaderHelper, MediaServerHelper
+
+from .orphan_files import scan as scan_orphan_files, purge_source
 
 VIDEO_EXT = {".mkv", ".mp4", ".ts", ".m2ts", ".avi", ".mov", ".wmv", ".iso", ".rmvb", ".flv", ".webm"}
 HISTORY_KEEP = 300
@@ -50,9 +54,9 @@ class UnwatchedCleanup(_PluginBase):
     """按 Plex 观看记录清理长期无人观看的媒体库内容。"""
 
     plugin_name = "媒体库无人观看清理"
-    plugin_desc = "删除 Plex 中长期无人观看的电影和剧集：先发通知预告，宽限期内仍无人观看才删除。"
+    plugin_desc = "按观看记录清理媒体库，并自动清理媒体库和下载器均无引用的下载残留。"
     plugin_icon = "clean.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "peter5842"
     author_url = "https://github.com/peter5842"
     plugin_config_prefix = "unwatchedcleanup_"
@@ -73,16 +77,22 @@ class UnwatchedCleanup(_PluginBase):
     _skip_category = "刷流"
     _mediaservers: List[str] = []
     _scheduler: Optional[BackgroundScheduler] = None
+    _orphan_enabled = False
+    _orphan_dry_run = True
+    _orphan_cron = "0 5 * * *"
+    _orphan_download_dirs = ""
+    _orphan_min_age_days = 1
+    _orphan_max_actions = 10
 
     # ------------------------------------------------------------------ 配置
     def init_plugin(self, config: Optional[dict] = None):
         """应用配置；“立即运行一次”用插件自己的一次性调度器，周期任务交给宿主。"""
         self.stop_service()
-        if not config:
-            return
+        self._stop = threading.Event()
+        config = config or {}
         self._enabled = bool(config.get("enabled"))
         self._onlyonce = bool(config.get("onlyonce"))
-        self._dry_run = bool(config.get("dry_run"))
+        self._dry_run = config.get("dry_run", True) is not False
         self._notify = bool(config.get("notify"))
         self._cron = (config.get("cron") or "30 6 * * *").strip()
         self._days = self.__to_int(config.get("days"), 180, minimum=1)
@@ -97,6 +107,12 @@ class UnwatchedCleanup(_PluginBase):
         self._local_path = (config.get("local_path") or "").strip()
         self._skip_category = (config.get("skip_category") or "").strip()
         self._mediaservers = config.get("mediaservers") or []
+        self._orphan_enabled = config.get("orphan_enabled") is True
+        self._orphan_dry_run = config.get("orphan_dry_run", True) is not False
+        self._orphan_cron = str(config.get("orphan_cron") or "0 5 * * *").strip()
+        self._orphan_download_dirs = str(config.get("orphan_download_dirs") or "").strip()
+        self._orphan_min_age_days = self.__to_int(config.get("orphan_min_age_days"), 1, minimum=1)
+        self._orphan_max_actions = min(100, self.__to_int(config.get("orphan_max_actions"), 10, minimum=1))
 
         if self._onlyonce:
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
@@ -126,25 +142,33 @@ class UnwatchedCleanup(_PluginBase):
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return []
+        """孤立文件状态和只读预览；执行入口使用宿主后台服务。"""
+        return [
+            {"path": "/orphans/status", "endpoint": self.orphan_status, "methods": ["GET"], "auth": "apikey", "summary": "孤立下载清理状态"},
+            {"path": "/orphans/preview", "endpoint": self.preview_orphans, "methods": ["POST"], "auth": "apikey", "summary": "只读预览孤立下载文件"},
+        ]
 
     def get_service(self) -> List[Dict[str, Any]]:
-        if not self._enabled or not self._cron:
+        """两类清理分别调度，均由 MoviePilot 宿主管理。"""
+        if not self._enabled:
             return []
-        try:
-            trigger = CronTrigger.from_crontab(self._cron)
-        except (TypeError, ValueError) as err:
-            logger.error(f"{self.plugin_name} 执行周期无效：{err}")
-            return []
-        return [{
-            "id": "UnwatchedCleanup",
-            "name": self.plugin_name,
-            "trigger": trigger,
-            "func": self.run,
-            "kwargs": {},
-        }]
+        services = []
+        entries = [("UnwatchedCleanup", self.plugin_name, self._cron, self.run)]
+        if self._orphan_enabled:
+            entries.append(("OrphanDownloads", "孤立下载文件清理", self._orphan_cron, self.run_orphans))
+        for service_id, name, cron, func in entries:
+            try:
+                trigger = CronTrigger.from_crontab(cron, timezone=settings.TZ)
+            except (TypeError, ValueError):
+                logger.error(f"{name} 执行周期无效，未添加定时任务")
+                continue
+            services.append({"id": service_id, "name": name, "trigger": trigger, "func": func,
+                             "kwargs": {"max_instances": 1, "coalesce": True}})
+        return services
 
     def stop_service(self):
+        if hasattr(self, "_stop"):
+            self._stop.set()
         scheduler, self._scheduler = self._scheduler, None
         try:
             if scheduler:
@@ -208,6 +232,20 @@ class UnwatchedCleanup(_PluginBase):
                     col(4, "VTextField", model="skip_category", label="跳过的下载器分类",
                         hint="匹配硬链接种子时跳过这个 qB 分类（如刷流）", **{"persistent-hint": True}),
                 ]},
+                {"component": "VRow", "content": [
+                    col(3, "VSwitch", model="orphan_enabled", label="清理孤立下载文件"),
+                    col(3, "VSwitch", model="orphan_dry_run", label="孤立文件仅预览",
+                        hint="全局仅预览开关也会阻止孤立文件删除", **{"persistent-hint": True}),
+                    col(3, "VCronField", model="orphan_cron", label="孤立文件清理周期"),
+                    col(3, "VTextField", model="orphan_min_age_days", label="源文件静置天数", type="number", min=1),
+                ]},
+                {"component": "VRow", "content": [
+                    col(9, "VTextarea", model="orphan_download_dirs", label="下载目录映射", rows=3,
+                        hint="每行 MP目录:下载器目录1,下载器目录2；任一下载/做种任务和媒体库硬链接引用都会保留文件", **{"persistent-hint": True}),
+                    col(3, "VTextField", model="orphan_max_actions", label="孤立文件单次上限", type="number", min=1, max=100),
+                ]},
+                {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text":
+                    "孤立文件按静置时间判断，独立于 180 天观看规则。扫描所有已配置下载器（含停用配置），无法完整核对时停止；执行前再次核对引用和文件身份。删除后实际释放空间，不进入回收区。"}},
                 {"component": "VRow", "content": [{
                     "component": "VCol", "props": {"cols": 12},
                     "content": [{"component": "VAlert", "props": {
@@ -231,12 +269,20 @@ class UnwatchedCleanup(_PluginBase):
             "local_path": "/media/",
             "skip_category": "刷流",
             "mediaservers": [],
+            "orphan_enabled": False,
+            "orphan_dry_run": True,
+            "orphan_cron": "0 5 * * *",
+            "orphan_download_dirs": "",
+            "orphan_min_age_days": 1,
+            "orphan_max_actions": 10,
         }
 
     def get_page(self) -> List[dict]:
         last = self.get_data("last_scan") or {}
         pending = self.get_data("pending") or {}
         history = self.get_data("history") or []
+        orphan = self.get_data("orphan_last_scan") or {}
+        orphan_history = self.get_data("orphan_history") or []
 
         def table(headers: List[str], rows: List[List[Any]]) -> dict:
             return {"component": "VTable", "props": {"hover": True, "density": "compact"}, "content": [
@@ -261,6 +307,13 @@ class UnwatchedCleanup(_PluginBase):
 
         return [
             {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": summary}},
+            {"component": "div", "props": {"class": "text-h6 mt-4 mb-2"}, "text": "孤立下载文件"},
+            {"component": "VAlert", "props": {"type": "error" if orphan.get("error") else "info", "variant": "tonal",
+                "text": (f"上次运行 {orphan.get('time', '—')}（{orphan.get('mode', '—')}）：候选 {orphan.get('candidates', 0)} 项，"
+                         f"删除 {orphan.get('deleted', 0)} 项；{orphan.get('error') or '仅处理配置的下载目录。'}")}},
+            table(["候选路径", "大小", "状态"], [[r["path"], human(r["size"]), r["status"]] for r in orphan.get("rows", [])]),
+            {"component": "div", "text": "；".join(orphan.get("warnings", []))},
+            table(["操作时间", "文件", "大小", "结果"], [[h.get("time", ""), h.get("path", ""), human(h.get("size", 0)), h.get("message", h.get("status", ""))] for h in reversed(orphan_history[-100:])]),
             {"component": "div", "props": {"class": "text-h6 mt-4 mb-2"}, "text": f"宽限期内（{len(pending)}）"},
             table(["标题", "年份", "类型", "大小", "预告日期", "预计删除"], pending_rows)
             if pending_rows else {"component": "div", "text": "无"},
@@ -268,6 +321,79 @@ class UnwatchedCleanup(_PluginBase):
             table(["删除时间", "标题", "年份", "类型", "大小"], history_rows)
             if history_rows else {"component": "div", "text": "无"},
         ]
+
+    # ------------------------------------------------------------------ 孤立下载
+    def orphan_status(self) -> dict:
+        """返回孤立文件扫描结果和操作记录，不包含下载器凭据。"""
+        return {"success": True, "enabled": self._orphan_enabled,
+                "preview": self._dry_run or self._orphan_dry_run, "cron": self._orphan_cron,
+                "last_scan": self.get_data("orphan_last_scan") or {},
+                "history": self.get_data("orphan_history") or []}
+
+    def preview_orphans(self) -> dict:
+        """接口始终只预览，即使配置已启用实际删除。"""
+        return self.run_orphans(preview=True)
+
+    def run_orphans(self, preview: bool = False) -> dict:
+        """与观看清理互斥运行，删除前重新读取下载器和媒体库引用。"""
+        if not preview and not (self._enabled and self._orphan_enabled):
+            return {"success": False, "message": "孤立下载清理未启用"}
+        if not lock.acquire(blocking=False):
+            return {"success": False, "message": "已有媒体清理任务正在运行"}
+        stop = self._stop
+        config = {"download_dirs": self._orphan_download_dirs,
+                  "library_dirs": [d.rstrip("/") for d in self._library_dirs],
+                  "min_age_days": self._orphan_min_age_days}
+        dry_run = preview or self._dry_run or self._orphan_dry_run
+        last = {"time": datetime.datetime.now().isoformat(timespec="seconds"), "mode": "预览" if dry_run else "执行",
+                "candidates": 0, "deleted": 0, "rows": [], "error": ""}
+        try:
+            directory = self.get_data_path()
+            directory.mkdir(parents=True, exist_ok=True)
+            with (directory / "orphans.lock").open("a") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                report = scan_orphan_files(config, DownloaderHelper(), time.time(), stop.is_set)
+                last.update(report, candidates=len(report["rows"]))
+                self.save_data("orphan_last_scan", last)
+                if dry_run:
+                    return {"success": True, "data": last}
+                for row in report["rows"][:self._orphan_max_actions]:
+                    if stop.is_set():
+                        raise ValueError("配置已变更，停止本轮清理")
+                    fresh = scan_orphan_files(config, DownloaderHelper(), time.time(), stop.is_set)
+                    current = next((item for item in fresh["rows"] if item["path"] == row["path"]), None)
+                    if not current or current["signature"] != row["signature"]:
+                        row["status"] = "已变化，保留"
+                        continue
+                    event = {"id": uuid.uuid4().hex, "time": datetime.datetime.now().isoformat(timespec="seconds"),
+                             "path": row["path"], "size": row["size"], "status": "intent", "message": "删除结果待核对"}
+                    history = self.get_data("orphan_history") or []
+                    history.append(event)
+                    self.save_data("orphan_history", history[-HISTORY_KEEP:])
+                    try:
+                        purge_source(current, stopped=stop.is_set)
+                    except Exception as error:
+                        reason = str(error) if isinstance(error, ValueError) else "剩余文件保留，等待下轮核对"
+                        event.update(status="uncertain", message=f"未完成删除：{reason}")
+                        row["status"] = event["message"]
+                    else:
+                        event.update(status="success", message="已删除")
+                        row["status"] = "已删除"
+                        last["deleted"] += 1
+                        logger.info(f"孤立下载清理：已删除 {row['path']}，{human(row['size'])}")
+                    self.save_data("orphan_history", history[-HISTORY_KEEP:])
+                    self.save_data("orphan_last_scan", last)
+                return {"success": not any(row["status"].startswith("未完成") for row in last["rows"]), "data": last}
+        except Exception:
+            # 异常中的下载器连接信息可能含密钥，不写入日志或页面。
+            last["error"] = "本轮未能完整核对下载器、目录或操作状态，已停止清理。"
+            logger.warning(f"孤立下载清理：{last['error']}")
+            return {"success": False, "message": last["error"]}
+        finally:
+            try:
+                self.save_data("orphan_last_scan", last)
+            finally:
+                lock.release()
 
     # ------------------------------------------------------------------ 主流程
     def run(self):
@@ -294,10 +420,19 @@ class UnwatchedCleanup(_PluginBase):
         subs = self.__subscribed_tmdb_ids()
         roots = tuple(self._library_dirs)
 
+        state: Dict[str, dict] = self.get_data("pending") or {}
+        collected = self.__collect(plex)
+        current_ids = {self.__item_id(item) for item in collected}
+        # 文件已部分删除时仍保留原清理计划，避免下一轮因 Plex 条目消失而漏掉重试。
+        retry_items = [dict(entry["cleanup_item"]) for key, entry in state.items()
+                       if entry.get("cleanup_item") and key not in current_ids]
         candidates = []
-        for item in self.__collect(plex):
+        for item in collected + retry_items:
+            pending_item = state.get(self.__item_id(item), {}).get("cleanup_item")
+            item["keys"] = set(item["keys"])
+
             files = [f for f in item["files"] if f.startswith(roots) and os.path.exists(f)]
-            if not files:
+            if not files and not pending_item:
                 continue
             if item["newest_added"] > cutoff or item["last_viewed"] > cutoff:
                 continue
@@ -305,8 +440,14 @@ class UnwatchedCleanup(_PluginBase):
                 continue
             if item["tmdb"] and item["tmdb"] in subs:
                 continue
-            item["files"] = files
-            item["size"] = sum(os.path.getsize(f) for f in files)
+            if pending_item:
+                item["files"] = pending_item["files"]
+                item["records"] = pending_item["records"]
+                item["fallback_inodes"] = pending_item["fallback_inodes"]
+                item["size"] = pending_item["size"]
+            else:
+                item["files"] = files
+                item["size"] = sum(os.path.getsize(f) for f in files)
             candidates.append(item)
         candidates.sort(key=lambda i: i["newest_added"])
         total = sum(i["size"] for i in candidates)
@@ -322,7 +463,6 @@ class UnwatchedCleanup(_PluginBase):
             self.save_data("last_scan", last)
             return
 
-        state: Dict[str, dict] = self.get_data("pending") or {}
         current = {self.__item_id(i): i for i in candidates}
         rescued = [v.get("title", k) for k, v in state.items() if k not in current]
         state = {k: v for k, v in state.items() if k in current}
@@ -350,6 +490,16 @@ class UnwatchedCleanup(_PluginBase):
             if self._limit and len(deleted) >= self._limit:
                 break
             try:
+                if "records" not in item:
+                    item["records"] = {f: self.__transfer_record(f) for f in item["files"]}
+                    item["fallback_inodes"] = []
+                    for f in item["files"]:
+                        if not item["records"][f] and os.path.exists(f):
+                            stat = os.stat(f)
+                            if stat.st_nlink > 1:
+                                item["fallback_inodes"].append([stat.st_dev, stat.st_ino])
+                state[self.__item_id(item)]["cleanup_item"] = dict(item, keys=sorted(key for key in item["keys"] if key))
+                self.save_data("pending", state)
                 self.__delete_item(item)
             except Exception as err:
                 logger.error(f"  删除 {item['title']} ({item['year']}) 失败：{err}", exc_info=True)
@@ -376,7 +526,7 @@ class UnwatchedCleanup(_PluginBase):
 
         last["deleted"] = len(deleted)
         self.save_data("last_scan", last)
-        logger.info(f"[执行] 本次删除 {len(deleted)} 项，{len(state)} 项在宽限期内")
+        logger.info(f"[执行] 本次删除 {len(deleted)} 项，{len(state)} 项待清理（含宽限期和失败重试）")
 
     @staticmethod
     def __item_id(item: dict) -> str:
@@ -511,40 +661,42 @@ class UnwatchedCleanup(_PluginBase):
 
     # ------------------------------------------------------------------ 删除
     def __delete_item(self, item: dict):
-        handled = set()
-        for f in item["files"]:
-            rec = self.__transfer_record(f)
+        """完成源文件和媒体文件清理，部分失败保留计划供下一次运行重试。"""
+        records = item["records"]
+        for f, rec in records.items():
             if not rec:
                 continue
+            # 上一次已成功删除此记录时，允许重试同一作品的其余记录。
+            source = rec.get("src") or ""
+            local_source = rec.get("src_storage") in (None, "local")
+            if local_source and source and not os.path.exists(source) and not os.path.exists(f):
+                continue
             res = self.__mp_api("DELETE", "/history/transfer", {"deletesrc": "true", "deletedest": "true"}, rec)
-            if res.get("success"):
-                handled.add(f)
-            else:
-                logger.warning(f"    MoviePilot 删除 {f} 失败：{res.get('message')}")
+            if not res.get("success"):
+                raise RuntimeError(f"MoviePilot 删除 {f} 未完成：{res.get('message')}")
+            if os.path.exists(f) or (local_source and source and os.path.exists(source)):
+                raise RuntimeError(f"MoviePilot 返回成功，但源文件或媒体文件仍存在：{f}")
 
-        rest = [f for f in item["files"] if f not in handled and os.path.exists(f)]
-        if rest:
-            inodes = {os.stat(f).st_ino for f in rest if os.stat(f).st_nlink > 1}
-            if inodes:
-                for name, hashes in self.__torrents_by_inode(inodes).items():
-                    logger.info(f"    删除下载器任务：{name}")
-            for f in rest:
-                if os.path.exists(f):
-                    os.remove(f)
+        inodes = {tuple(value) for value in item["fallback_inodes"]}
+        if inodes:
+            for name in self.__torrents_by_inode(inodes):
+                logger.info(f"    删除下载器任务：{name}")
+        for f, rec in records.items():
+            if not rec and os.path.exists(f):
+                os.remove(f)
         self.__tidy(item["files"])
 
-    def __torrents_by_inode(self, inodes: Set[int]) -> Dict[str, List[str]]:
+    def __torrents_by_inode(self, inodes: Set[Tuple[int, int]]) -> Dict[str, List[str]]:
         """删除文件硬链接到 inodes 的 qB 任务（跳过指定分类），返回 名称->哈希。"""
         removed: Dict[str, List[str]] = {}
         services = DownloaderHelper().get_services(type_filter="qbittorrent")
         for service_name, service in (services or {}).items():
             qb = service.instance
             if not qb or (hasattr(qb, "is_inactive") and qb.is_inactive()):
-                continue
+                raise RuntimeError(f"下载器 {service_name} 未连接，保留清理计划")
             torrents, error = qb.get_torrents()
             if error:
-                logger.warning(f"    读取 {service_name} 任务列表失败，跳过匹配硬链接种子")
-                continue
+                raise RuntimeError(f"读取 {service_name} 任务列表失败，保留清理计划")
             hits = {}
             for t in torrents:
                 save_path = t.get("save_path") or ""
@@ -553,12 +705,15 @@ class UnwatchedCleanup(_PluginBase):
                     continue
                 for tf in qb.get_files(t.get("hash")) or []:
                     try:
-                        if os.stat(os.path.join(save_path, tf.get("name"))).st_ino in inodes:
+                        stat = os.stat(os.path.join(save_path, tf.get("name")))
+                        if (stat.st_dev, stat.st_ino) in inodes:
                             hits[t.get("hash")] = t.get("name")
                             break
                     except OSError:
                         continue
-            if hits and qb.delete_torrents(delete_file=True, ids=list(hits)):
+            if hits:
+                if not qb.delete_torrents(delete_file=True, ids=list(hits)):
+                    raise RuntimeError(f"下载器 {service_name} 删除任务失败，保留清理计划")
                 for h, n in hits.items():
                     removed.setdefault(n, []).append(h)
         return removed
